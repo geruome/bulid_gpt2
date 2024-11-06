@@ -210,6 +210,15 @@ model = torch.compile(model) # always speed up.
 tokenizer = tiktoken.get_encoding('gpt2')
 torch.set_float32_matmul_precision('high') # FP32 -> TF32
 
+total_batch_size = 2**17 # 2**19, ~0.5M, in number of tokens
+B = 16 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+# one backward for every grad_accum_steps steps
+
 
 class DataLoader:
     def __init__(self, B, T, data_root, device, process_rank=0, num_processes=1, split='train'):
@@ -232,6 +241,8 @@ class DataLoader:
         with open(filename, 'r') as f:
             text = f.read()
         idx = tokenizer.encode(text)
+        print(f"loading {filename} with {len(idx)} tokens ...") 
+        # 3.3e5 in input.txt; 
         self.tokens = torch.tensor(idx, dtype=torch.long, device=self.device)
 
     def reset(self):
@@ -284,11 +295,15 @@ def train_model():
     model.train()
     for step in range(max_steps):
         t0 = time.time()
-        x, y = train_loader.next_batch()
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        optimizer.zero_grad()
-        loss.backward()
+        loss_accum = 0
+        for micro_step in range(grad_accum_steps):            
+            x, y = train_loader.next_batch()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            optimizer.zero_grad()
+            loss /= grad_accum_steps # F.loss_func automatically averages the loss. We do it manually here.
+            loss_accum += loss.detach()
+            loss.backward() # accmulate losses
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -296,8 +311,8 @@ def train_model():
         optimizer.step()
         torch.cuda.synchronize()
         dt = time.time() - t0
-        if step % log_freq == 0:
-            print(f"step {step}, loss {loss.item()}, {dt*1000 :.2f} ms")
+        # if step % log_freq == 0:
+        print(f"step {step} | loss {loss_accum.item()} | lr {lr} | time {dt*1000 :.2f} ms")
 
 train_model()
 

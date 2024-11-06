@@ -7,6 +7,7 @@ from transformers import GPT2LMHeadModel, set_seed
 import tiktoken
 import os
 from os import path as osp
+import time
 
 
 class MLP(nn.Module):
@@ -182,26 +183,21 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.to(device)
-model.eval()
+# model.eval()
+model = torch.compile(model) # always speed up. 
 
 tokenizer = tiktoken.get_encoding('gpt2')
-
-
-def load_tokens(filename):
-    with open(filename, 'r') as f:
-        text = f.read()
-    idx = tokenizer.encode(text)
-    idx = torch.tensor(idx, dtype=torch.long, device=device)
-    return idx
+torch.set_float32_matmul_precision('high') # FP32 -> TF32
 
 
 class DataLoader:
-    def __init__(self, B, T, data_root, process_rank=0, num_processes=1, split='train'):
+    def __init__(self, B, T, data_root, device, process_rank=0, num_processes=1, split='train'):
         # parallel settings: num_processes, process_rank
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.device = device
         assert split in {'train', 'val'}
 
         # get the shard filenames
@@ -211,9 +207,15 @@ class DataLoader:
         assert len(shards) > 0, f"no shards found for {split}"
         self.reset()
 
+    def load_tokens(self, filename):
+        with open(filename, 'r') as f:
+            text = f.read()
+        idx = tokenizer.encode(text)
+        self.tokens = torch.tensor(idx, dtype=torch.long, device=self.device)
+
     def reset(self):
         self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -225,20 +227,57 @@ class DataLoader:
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             # reset to the next shard
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.load_tokens(self.shards[self.current_shard])
             assert len(self.tokens) > B * T * self.num_processes, f"shard {self.shards[self.current_shard]} to short"
             self.current_position = B * T * self.process_rank
         return x, y
 
 B = 16
-T = 64
+T = 512
 data_root = './data'
-train_loader = DataLoader(B, T, data_root)
-for i in range(5):
-    x, y = train_loader.next_batch()
-    logits, loss = model(x, y)
-    print(loss) 
+train_loader = DataLoader(B, T, data_root, device=device)
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 100
+max_steps = 19073
+optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8)
+
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
+log_freq = 10
+
+def train_model():
+    model.train()
+    for step in range(max_steps):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        optimizer.zero_grad()
+        loss.backward()
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        torch.cuda.synchronize()
+        dt = time.time() - t0
+        if step % log_freq == 0:
+            print(f"step {step}, loss {loss.item()}, {dt*1000 :.2f} ms")
+
+train_model()
 
 def test_model():
     B = 5

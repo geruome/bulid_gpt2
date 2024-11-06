@@ -17,6 +17,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4*config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -33,6 +34,7 @@ class CausalSelfAttention(nn.Module):
 
         self.c_attn = nn.Linear(config.n_embd, 3*config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # register_buffer for temporary var: an lower triangular matrix for masking
@@ -94,6 +96,23 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # bias=False ???
 
+        # weight sharing scheme, same data_ptr
+        self.transformer.wte.weight = self.lm_head.weight
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        # std = 0.02 is default in GPT2 paper. And regularize the effect of residual stream.
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5 # 2 residual link per layer
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None): # idx is the tokenized result, (B,T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Can't forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -107,7 +126,10 @@ class GPT(nn.Module):
             x = layer(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # B, T, vocab_size
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
     
     @classmethod
     def from_pretrained(cls, model_type):
@@ -157,12 +179,66 @@ class GPT(nn.Module):
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model = GPT.from_pretrained('gpt2')
-# model = GPT(GPTConfig())
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 model.to(device)
 model.eval()
 
 tokenizer = tiktoken.get_encoding('gpt2')
+
+
+def load_tokens(filename):
+    with open(filename, 'r') as f:
+        text = f.read()
+    idx = tokenizer.encode(text)
+    idx = torch.tensor(idx, dtype=torch.long, device=device)
+    return idx
+
+
+class DataLoader:
+    def __init__(self, B, T, data_root, process_rank=0, num_processes=1, split='train'):
+        # parallel settings: num_processes, process_rank
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        assert split in {'train', 'val'}
+
+        # get the shard filenames
+        shards = os.listdir(data_root)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for {split}"
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            # reset to the next shard
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            assert len(self.tokens) > B * T * self.num_processes, f"shard {self.shards[self.current_shard]} to short"
+            self.current_position = B * T * self.process_rank
+        return x, y
+
+B = 16
+T = 64
+data_root = './data'
+train_loader = DataLoader(B, T, data_root)
+for i in range(5):
+    x, y = train_loader.next_batch()
+    logits, loss = model(x, y)
+    print(loss) 
+
 
 def test_model():
     B = 5
@@ -191,4 +267,4 @@ def test_model():
     for idx in lst:
         print(">", tokenizer.decode(idx))
 
-test_model()
+# test_model()

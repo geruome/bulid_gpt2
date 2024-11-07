@@ -92,7 +92,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList(Block(config) for _ in range(config.n_head)),
+            h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
             ln_f = nn.LayerNorm(config.n_embd),  # final_ln
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # bias=False ???
@@ -199,26 +199,37 @@ class GPT(nn.Module):
         return optimizer
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
-model.to(device)
-# model.eval()
-model = torch.compile(model) # always speed up. 
+
+ddp = int(os.environ.get('RANK', -1)) != -1 # boolen, is this a ddp run?
+print(f"if using ddp : {ddp}")
+if ddp:
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK']) # symbol to recognize which GPU this script running on 
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE']) # total GPU num
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # only matser process(cuda:0) will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 tokenizer = tiktoken.get_encoding('gpt2')
-torch.set_float32_matmul_precision('high') # FP32 -> TF32
-
-total_batch_size = 2**17 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
-T = 1024 # sequence length
-assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-# one backward for every grad_accum_steps steps
-
 
 class DataLoader:
     def __init__(self, B, T, data_root, device, process_rank=0, num_processes=1, split='train'):
@@ -264,16 +275,40 @@ class DataLoader:
             self.current_position = B * T * self.process_rank
         return x, y
 
-B = 16
-T = 512
+
+set_seed(int(time.time()%(2**32)))
+
+total_batch_size = 2**16 # 2**19, ~0.5M, in number of tokens
+B = 16 # micro batch size
+T = 512 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+# one backward for every grad_accum_steps steps
+
 data_root = './data'
-train_loader = DataLoader(B, T, data_root, device=device)
+train_loader = DataLoader(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, data_root=data_root, device=device)
+
+torch.set_float32_matmul_precision('high') # FP32 -> TF32
+
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+model.to(device)
+# model = torch.compile(model) # always speed up. 
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank]) # wrap model into DDP container
+# model.eval()
+
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 100
 max_steps = 19073
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8)
 
 def get_lr(it):
@@ -290,6 +325,11 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 log_freq = 10
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
 
 def train_model():
     model.train()
@@ -303,7 +343,12 @@ def train_model():
             optimizer.zero_grad()
             loss /= grad_accum_steps # F.loss_func automatically averages the loss. We do it manually here.
             loss_accum += loss.detach()
+            # with model.no_sync():
+            if ddp: # every GPU only share its gradients at the last micro_step
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) 
             loss.backward() # accmulate losses
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # loss_accum /= ddp_world_size
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -311,10 +356,19 @@ def train_model():
         optimizer.step()
         torch.cuda.synchronize()
         dt = time.time() - t0
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_per_sec = tokens_processed / dt
         # if step % log_freq == 0:
-        print(f"step {step} | loss {loss_accum.item()} | lr {lr} | time {dt*1000 :.2f} ms")
+        if master_process:
+            print(f"step {step:5d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} train {loss_accum:.4f}\n")
 
 train_model()
+
+if ddp:
+    destroy_process_group()
+
 
 def test_model():
     B = 5

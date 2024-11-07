@@ -9,6 +9,7 @@ import os
 from os import path as osp
 import time
 import inspect
+import np
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -229,52 +230,61 @@ else:
         device = "mps"
     print(f"using device: {device}")
 
-tokenizer = tiktoken.get_encoding('gpt2')
+# def load_tokens(filename):
+#     npt = np.load(filename)
+#     npt = npt.astype(np.int32)
+#     ptt = torch.tensor(npt, dtype=torch.long)
+#     return ptt
 
-class DataLoader:
-    def __init__(self, B, T, data_root, device, process_rank=0, num_processes=1, split='train'):
-        # parallel settings: num_processes, process_rank
+class DataLoaderLite:
+    def __init__(self, B, T, process_rank, num_processes, device, split):
         self.B = B
         self.T = T
+        self.device = device
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.device = device
         assert split in {'train', 'val'}
 
         # get the shard filenames
+        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
-        assert len(shards) > 0, f"no shards found for {split}"
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
         self.reset()
 
     def load_tokens(self, filename):
-        with open(filename, 'r') as f:
-            text = f.read()
-        idx = tokenizer.encode(text)
-        print(f"loading {filename} with {len(idx)} tokens ...") 
-        # 3.3e5 in input.txt; 
-        self.tokens = torch.tensor(idx, dtype=torch.long, device=self.device)
+        npt = np.load(filename)
+        npt = npt.astype(np.int32)
+        ptt = torch.tensor(npt, dtype=torch.long, device=self.device)
+        return ptt
 
     def reset(self):
+        # state, init at shard zero
         self.current_shard = 0
-        self.load_tokens(self.shards[self.current_shard])
+        self.tokens = self.load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T)
-        y = (buf[1:]).view(B, T)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
         self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            # reset to the next shard
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.load_tokens(self.shards[self.current_shard])
-            assert len(self.tokens) > B * T * self.num_processes, f"shard {self.shards[self.current_shard]} to short"
+            self.tokens = self.load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
         return x, y
 
+
+# tokenizer = tiktoken.get_encoding('gpt2')
 
 set_seed(int(time.time()%(2**32)))
 
@@ -289,7 +299,8 @@ if master_process:
 # one backward for every grad_accum_steps steps
 
 data_root = './data'
-train_loader = DataLoader(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, data_root=data_root, device=device)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device, split='train')
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high') # FP32 -> TF32
 
@@ -306,8 +317,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 100
-max_steps = 19073
+warmup_steps = 715 # 375M / (B=2^19)
+max_steps = 19073 # 10B / (B=2^19)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8)
 
@@ -325,22 +336,89 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 log_freq = 10
+val_freq = 250
+save_freq = 5000
+assert save_freq % val_freq == 0
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+
+def generate_sequence():
+    B = 5
+    max_length = 20
+    tokenizer = tiktoken.get_encoding('gpt2')
+    input_sentence = "Hello, I'm a language model,"
+    x = tokenizer.encode(input_sentence)
+    x = torch.tensor(x, dtype=torch.long, device=device)
+    x = x.unsqueeze(0).repeat(B, 1) # B, T
+
+    set_seed(42)
+    while x.shape[1] < max_length:
+        with torch.no_grad():
+            logits = model(x) # B, T, vocab_size
+            logits = logits[:, -1, :]  # B, vocab_size
+            probs = F.softmax(logits, dim=-1)  # logits != probs , softmax is needed
+            # 50 is default in huggingface pipeline.  Clamp down rare probs.
+            topk_probs, topk_ids = torch.topk(probs, 50, dim=-1) # (B, 50). 
+            ix = torch.multinomial(topk_probs, 1) # sampling
+            nx = torch.gather(topk_ids, -1, ix) # get data a/to dim and idx
+            x = torch.cat((x, nx), dim=1) # B, T+1
+
+    lst = x.tolist()
+    print(input_sentence)
+    for idx in lst:
+        print(">", tokenizer.decode(idx))
+
+
 def train_model():
     model.train()
     for step in range(max_steps):
         t0 = time.time()
+        last_step = (step == max_steps-1)
+
+        if step > 0 and (step % val_freq == 0 or last_step):
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % save_freq == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    torch.save(checkpoint, checkpoint_path)
+            
+                generate_sequence()
+
+
+            model.train()
+
         loss_accum = 0
+        optimizer.zero_grad()
         for micro_step in range(grad_accum_steps):            
             x, y = train_loader.next_batch()
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
                 logits, loss = model(x, y)
-            optimizer.zero_grad()
             loss /= grad_accum_steps # F.loss_func automatically averages the loss. We do it manually here.
             loss_accum += loss.detach()
             # with model.no_sync():
@@ -369,32 +447,3 @@ train_model()
 if ddp:
     destroy_process_group()
 
-
-def test_model():
-    B = 5
-    max_length = 30
-
-    tokenizer = tiktoken.get_encoding('gpt2')
-    input_sentence = "Hello, I'm a language model,"
-    x = tokenizer.encode(input_sentence)
-    x = torch.tensor(x, dtype=torch.long, device=device)
-    x = x.unsqueeze(0).repeat(B, 1) # B, T
-
-    set_seed(42)
-    while x.shape[1] < max_length:
-        with torch.no_grad():
-            logits = model(x) # B, T, vocab_size
-            logits = logits[:, -1, :]  # B, vocab_size
-            probs = F.softmax(logits, dim=-1)  # logits != probs , softmax is needed
-            # 50 is default in huggingface pipeline.  Clamp down rare probs.
-            topk_probs, topk_ids = torch.topk(probs, 50, dim=-1) # (B, 50). 
-            ix = torch.multinomial(topk_probs, 1) # sampling
-            nx = torch.gather(topk_ids, -1, ix) # get data a/to dim and idx
-            x = torch.cat((x, nx), dim=1) # B, T+1
-
-    lst = x.tolist()
-    print(input_sentence)
-    for idx in lst:
-        print(">", tokenizer.decode(idx))
-
-# test_model()

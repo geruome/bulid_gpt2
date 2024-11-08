@@ -13,6 +13,9 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from pdb import set_trace as stx
 from tqdm import tqdm
+from hellaswag import render_example, iterate_examples
+
+
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -318,7 +321,7 @@ if ddp:
 
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 1e-3
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 700 # origin 715 = 375M / (B=2^19)
 max_steps = 12000 # 0.8B / (B=2^16)
@@ -348,6 +351,7 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+writer = SummaryWriter(osp.join(log_dir, 'tb'))
 
 def generate_sequence():
     B = 5
@@ -375,10 +379,58 @@ def generate_sequence():
         for idx in lst:
             f.write(tokenizer.decode(idx) + '\n')
 
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+def val_hellaswag(step):
+    num_correct_norm = 0
+    num_total = 0
+    for i, example in enumerate(iterate_examples("val")):
+        # one example is only processed by one proc
+        if i % ddp_world_size != ddp_rank:
+            continue
+        _, tokens, mask, label = render_example(example)
+        tokens = tokens.to(device)
+        mask = mask.to(device)
+        with torch.no_grad():
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(tokens)
+            pred_norm = get_most_likely_row(tokens, mask, logits)
+        num_total += 1
+        num_correct_norm += int(pred_norm == label)
+    if ddp:
+        num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+        num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+        dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+        num_total = num_total.item()
+        num_correct_norm = num_correct_norm.item()
+    acc_norm = num_correct_norm / num_total
+    if master_process:
+        # print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f} \n")
+        writer.add_scalar('hellaswag_accuracy', acc_norm, step)
+
 
 def train_model():
     model.train()
-    writer = SummaryWriter(osp.join(log_dir, 'tb'))
 
     for step in tqdm(range(max_steps)):
         t0 = time.time()
@@ -404,7 +456,7 @@ def train_model():
                     f.write(f"{step} val {val_loss_accum.item():.4f} \n")
                 writer.add_scalar('val_loss', val_loss_accum.item(), step)
                 # saving states
-                if step > 0 and (step % save_freq == 0 or last_step):
+                if step > 0 and (last_step): # step % save_freq == 0 or
                     # optionally write model checkpoints
                     checkpoint_path = os.path.join(log_dir, 'states', f"model_{step:05d}.pt")
                     checkpoint = {
@@ -416,6 +468,7 @@ def train_model():
                     torch.save(checkpoint, checkpoint_path)
                 # generating examples
                 generate_sequence()
+                val_hellaswag(step)
 
             model.train()
 

@@ -9,7 +9,10 @@ import os
 from os import path as osp
 import time
 import inspect
-import np
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from pdb import set_trace as stx
+from tqdm import tqdm
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -246,7 +249,7 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get the shard filenames
-        data_root = "edu_fineweb10B"
+        data_root = "edu_fineweb1B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
@@ -300,7 +303,7 @@ if master_process:
 
 data_root = './data'
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device, split='train')
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, device=device, split="val")
 
 torch.set_float32_matmul_precision('high') # FP32 -> TF32
 
@@ -315,11 +318,11 @@ if ddp:
 
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
-max_lr = 6e-4
+max_lr = 1e-3
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 375M / (B=2^19)
-max_steps = 19073 # 10B / (B=2^19)
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+warmup_steps = 700 # origin 715 = 375M / (B=2^19)
+max_steps = 12000 # 0.8B / (B=2^16)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device_type=device)
 # optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8)
 
 def get_lr(it):
@@ -348,17 +351,17 @@ with open(log_file, "w") as f: # open for writing to clear the file
 
 def generate_sequence():
     B = 5
-    max_length = 20
+    max_length = 30
     tokenizer = tiktoken.get_encoding('gpt2')
     input_sentence = "Hello, I'm a language model,"
     x = tokenizer.encode(input_sentence)
     x = torch.tensor(x, dtype=torch.long, device=device)
     x = x.unsqueeze(0).repeat(B, 1) # B, T
 
-    set_seed(42)
+    # set_seed(42)
     while x.shape[1] < max_length:
         with torch.no_grad():
-            logits = model(x) # B, T, vocab_size
+            logits, loss = model(x) # B, T, vocab_size
             logits = logits[:, -1, :]  # B, vocab_size
             probs = F.softmax(logits, dim=-1)  # logits != probs , softmax is needed
             # 50 is default in huggingface pipeline.  Clamp down rare probs.
@@ -368,14 +371,16 @@ def generate_sequence():
             x = torch.cat((x, nx), dim=1) # B, T+1
 
     lst = x.tolist()
-    print(input_sentence)
-    for idx in lst:
-        print(">", tokenizer.decode(idx))
+    with open(log_file, "a") as f:
+        for idx in lst:
+            f.write(tokenizer.decode(idx) + '\n')
 
 
 def train_model():
     model.train()
-    for step in range(max_steps):
+    writer = SummaryWriter(osp.join(log_dir, 'tb'))
+
+    for step in tqdm(range(max_steps)):
         t0 = time.time()
         last_step = (step == max_steps-1)
 
@@ -394,12 +399,14 @@ def train_model():
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
-                print(f"validation loss: {val_loss_accum.item():.4f}")
+                # print(f"validation loss: {val_loss_accum.item():.4f}")
                 with open(log_file, "a") as f:
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                    f.write(f"{step} val {val_loss_accum.item():.4f} \n")
+                writer.add_scalar('val_loss', val_loss_accum.item(), step)
+                # saving states
                 if step > 0 and (step % save_freq == 0 or last_step):
                     # optionally write model checkpoints
-                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint_path = os.path.join(log_dir, 'states', f"model_{step:05d}.pt")
                     checkpoint = {
                         'model': raw_model.state_dict(),
                         'config': raw_model.config,
@@ -407,9 +414,8 @@ def train_model():
                         'val_loss': val_loss_accum.item()
                     }
                     torch.save(checkpoint, checkpoint_path)
-            
+                # generating examples
                 generate_sequence()
-
 
             model.train()
 
@@ -425,6 +431,8 @@ def train_model():
             if ddp: # every GPU only share its gradients at the last micro_step
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) 
             loss.backward() # accmulate losses
+        if master_process:
+            writer.add_scalar('train_loss', loss_accum, step)
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # loss_accum /= ddp_world_size
         lr = get_lr(step)
@@ -432,15 +440,16 @@ def train_model():
             param_group['lr'] = lr
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         dt = time.time() - t0
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
         # if step % log_freq == 0:
-        if master_process:
-            print(f"step {step:5d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        if step % log_freq == 0 and master_process:
+            str = f"step {step:5d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} \n"
+            # print(f"step {step:5d} | loss {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
-                f.write(f"{step} train {loss_accum:.4f}\n")
+                f.write(str)
 
 train_model()
 
